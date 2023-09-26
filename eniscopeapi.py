@@ -1,6 +1,8 @@
+# Eniscope API library - version 1.0
+
 import requests
 import json
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from cryptography.fernet import Fernet
 import credentials
 
@@ -149,6 +151,7 @@ class EniscopeAPIClient:
         Returns:
         - dict: List of channels.
         """
+
         if isinstance(organization_id, list):
             max_workers = len(organization_id)
             results = []
@@ -162,6 +165,10 @@ class EniscopeAPIClient:
 
                     except Exception as e:
                         results.append({"error": str(e)})
+
+                    finally:
+                        # Print a dot to the console to indicate progress
+                        print(".", end="", flush=True)
 
                 for org_id in organization_id:
                     executor.submit(query_single, org_id)
@@ -227,29 +234,50 @@ class EniscopeAPIClient:
         - dict: Dictionary of channel data with keys in the format 'channel_id_start_date_end_date'.
         """
         data = {}
+        THREAD_LIMIT = 20
+
+        # Create a generator of all tasks
+        tasks = (
+            (channel_id, date_range)
+            for channel_id in channel_ids
+            for date_range in date_ranges
+        )
+
+        def query_single(channel_id, date_range):
+            start_date, end_date = date_range
+            try:
+                result = self.get_channel_data(
+                    channel_id, start_date, end_date, fields, resolution
+                )
+                return channel_id, start_date, end_date, result
+            except Exception as e:
+                print(f"\nError for {channel_id} {start_date} {end_date}: {str(e)}")
 
         # Determine the maximum number of workers based on the input lists
-        max_workers = len(channel_ids) * len(date_ranges)
+        max_workers = min(THREAD_LIMIT, len(channel_ids) * len(date_ranges))
 
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            # Define a function to query channel data for a single channel or date range
-            def query_single(channel_id, date_range):
-                start_date, end_date = date_range
+            futures = {
+                executor.submit(query_single, channel_id, date_range): (
+                    channel_id,
+                    date_range,
+                )
+                for channel_id, date_range in tasks
+            }
+
+            for future in as_completed(futures):
+                channel_id, start_date, end_date, result = future.result()
+                data[f"{channel_id}_{start_date}_{end_date}"] = result
+                # Print a dot to the console to indicate progress
+                print(".", end="", flush=True)
+
+                # Submit new tasks as threads become available, if any are left
                 try:
-                    result = self.get_channel_data(
-                        channel_id, start_date, end_date, fields, resolution
-                    )
-                    data[f"{channel_id}_{start_date}_{end_date}"] = result
-                except Exception as e:
-                    # Handle exceptions for individual queries as needed
-                    data[f"{channel_id}_{start_date}_{end_date}"] = {"error": str(e)}
-
-            for channel_id in channel_ids:
-                for date_range in date_ranges:
-                    executor.submit(query_single, channel_id, date_range)
-
-            executor.shutdown(wait=True)
-
+                    next_task = next(tasks)
+                    futures[executor.submit(query_single, *next_task)] = next_task
+                except StopIteration:
+                    # No more tasks left
+                    pass
         return data
 
     def get_alarm_data(self, organization_id):
@@ -283,6 +311,9 @@ class EniscopeAPIClient:
                         org_alarms_dict.append(response["alarms"])
                     except Exception as e:
                         org_alarms_dict.append({"error": str(e)})
+                    finally:
+                        # Print a dot to the console to indicate progress
+                        print(".", end="", flush=True)
 
                 for org_id in organization_id:
                     executor.submit(query_single, org_id)
@@ -317,14 +348,24 @@ class EniscopeAPIClient:
                     result = self.get_alarm_rules(alarm_id)
                     alarm_rules_dict.append(result)
                 except Exception as e:
-                    alarm_rules_dict.append({"error": str(e)})
+                    print(
+                        f"\nError while retrieving alarm rules for {alarm_id}. Alarm will be skipped. Check alarm settings at https://analytics.eniscope.com/alarm/edit/{alarm_id}"
+                    )
+                finally:
+                    # Print a dot to the console to indicate progress
+                    print(".", end="", flush=True)
 
             def query_single_periods(alarm_id):
                 try:
                     result = self.get_alarm_periods(alarm_id)
                     alarm_periods_dict.append(result)
                 except Exception as e:
-                    alarm_periods_dict.append({"error": str(e)})
+                    print(
+                        f"\nError while retrieving alarm periods for {alarm_id}. Alarm will be skipped. Check alarm settings at https://analytics.eniscope.com/alarm/edit/{alarm_id}"
+                    )
+                finally:
+                    # Print a dot to the console to indicate progress
+                    print(".", end="", flush=True)
 
             for alarm_id in alarms_id_list:
                 executor.submit(query_single_rules, alarm_id)
@@ -369,3 +410,44 @@ class EniscopeAPIClient:
         response = self.get_request_data(url)
         del response["alarmperiods"][0]["links"]
         return response["alarmperiods"][0]
+
+    def get_events_list(self, organization_id, date_range=None):
+        """
+        Retrieve events for a specified organization ID.
+        Parameters:
+         - organization_id (str): The ID of the organization to retrieve data for.
+        Returns:
+         - dict: Organization events.
+        """
+        if not date_range or isinstance(date_range, int):
+            url = f"{self.base_url}events/?organization={organization_id}&daterange[]=today&limit=0"
+        elif isinstance(date_range, (list, tuple)):
+            url = f"{self.base_url}events/?organization={organization_id}&daterange[]={date_range[0]}&daterange[]={date_range[1]}&limit=100"
+        elif isinstance(date_range, str):
+            url = f"{self.base_url}events/?organization={organization_id}&daterange[]={date_range}&limit=100"
+
+        response = self.get_request_data(url)
+        if response["meta"]["pageCount"] == 0 and len(response["events"]) != 0:
+            return response["events"]
+        elif response["meta"]["pageCount"] != 0 and len(response["events"]) != 0:
+            pages = response["meta"]["pageCount"]
+            event_pages = response["events"]
+            with ThreadPoolExecutor(max_workers=pages) as executor:
+
+                def query_single(page):
+                    newurl = f"{url}&page={page}"
+                    try:
+                        response = self.get_request_data(newurl)
+                        event_pages.extend(response["events"])
+                    except Exception as e:
+                        print(f"\nError while reading event list at page: {page}")
+                    finally:
+                        # Print a dot to the console to indicate progress
+                        print(".", end="", flush=True)
+
+                for page in range(2, pages + 1):
+                    executor.submit(query_single, page)
+
+            return event_pages
+        else:
+            return response

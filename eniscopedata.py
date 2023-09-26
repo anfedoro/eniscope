@@ -1,3 +1,4 @@
+# Eniscope Data support Library - version 1.0
 
 from typing import List, Set, Union, Optional
 import pandas as pd
@@ -16,9 +17,11 @@ class Threshold:
         __str__(self): Returns a string representation of the threshold object.
     """
 
-    def __init__(self, threshold, operator: str):
+    def __init__(self, threshold, operator: str, field: str, reportInterval: int):
         self.threshold = threshold
         self.operator = operator
+        self.field = field
+        self.reportInterval = int(reportInterval / 60)
 
     def __eq__(self, other) -> bool:
         """
@@ -46,7 +49,7 @@ class Threshold:
         Returns:
             str: A string representation of the threshold object.
         """
-        return f"Threshold: {self.operator} {self.threshold}"
+        return f"{self.reportInterval} min average {self.field} {self.operator} {self.threshold}"
 
 
 import pandas as pd
@@ -81,17 +84,58 @@ class Schedule:
         Returns:
             bool: True if the day and time are in the schedule; False otherwise.
         """
-        if isinstance(other, (int, float, pd.Timestamp, pd.DatetimeIndex)):
-            if isinstance(other, (int, float)):
-                if self.tz:
-                    other = pd.Timestamp(int(other), unit="s", tz=self.tz).floor("min")
-                else:
-                    other = pd.Timestamp(int(other), unit="s").floor("min")
-            elif isinstance(other, pd.Timestamp):
-                other = other.floor("min")
+
+        if isinstance(other, (int, float)):
+            if self.tz:
+                other = pd.Timestamp(int(other), unit="s", tz=self.tz).floor("min")
+            else:
+                other = pd.Timestamp(int(other), unit="s").floor("min")
             return (
                 other.dayofweek + 1
             ) % 7 in self.days and other.time() in self.time_range
+
+        elif isinstance(other, pd.Timestamp):
+            other = other.floor("min")
+            return (
+                other.dayofweek + 1
+            ) % 7 in self.days and other.time() in self.time_range
+
+        elif isinstance(other, pd.Series):
+            if other.dtypes == f"datetime64[ns, {self.tz}]":
+                time_match = other.apply(lambda x: x.time() in self.time_range)
+                day_match = other.apply(lambda x: (x.dayofweek + 1) % 7 in self.days)
+                return time_match & day_match
+            elif other.dtypes == "datetime64[ns]":
+                time_match = (
+                    other.tz_localize("UTC")
+                    .tz_convert(self.tz)
+                    .apply(lambda x: x.time() in self.time_range)
+                )
+                day_match = (
+                    other.tz_localize("UTC")
+                    .tz_convert(self.tz)
+                    .apply(lambda x: (x.dayofweek + 1) % 7 in self.days)
+                )
+                return time_match & day_match
+            elif other.dtypes == "int64":
+                time_match = other.apply(
+                    lambda x: pd.Timestamp(int(x), unit="s", tz=self.tz)
+                    .floor("min")
+                    .time()
+                    in self.time_range
+                )
+                day_match = other.apply(
+                    lambda x: (
+                        pd.Timestamp(int(x), unit="s", tz=self.tz)
+                        .floor("min")
+                        .dayofweek
+                        + 1
+                    )
+                    % 7
+                    in self.days
+                )
+                return time_match & day_match
+
         else:
             return False
 
@@ -147,4 +191,55 @@ class Schedule:
         start_time = str(self.time_range[0])[:-3]
         end_time = str(self.time_range[-1])[:-3]
 
-        return f"{formatted_days} from: {start_time} to {end_time}"
+        return f"{formatted_days}: {start_time} to {end_time}"
+
+
+# # Function which generate report with calculation results
+def createReport(
+    org_name,
+    channel_df,
+    channel_id,
+    alarm_name,
+    schedule: Schedule,
+    rule: Threshold,
+    is_active,
+):
+    """
+    Function which generate report with calculation results
+
+    Args:
+        org_name (str): Organization name.
+        channel_df (pd.DataFrame): Dataframe with channel data.
+        channel_id (str): Channel ID.
+        alarm_name (str): Alarm name.
+        schedule (Schedule): Schedule object.
+        rule (Threshold): Threshold object.
+
+    Returns:
+        str: Report string.
+    """
+
+    active_time = str(pd.to_timedelta(is_active, unit="min"))[-8:-3]
+
+    energy = channel_df[
+        (channel_df["channelId"] == channel_id)
+        & (channel_df[f"{rule.field}_alarm_active"])
+    ]["E"].sum()
+
+    channel_name = channel_df[channel_df["channelId"] == channel_id][
+        "channelName"
+    ].values[0]
+
+    report = pd.DataFrame(
+        {
+            "Organization": [org_name],
+            "Equipment": [channel_name],
+            "Alarm": [alarm_name],
+            "Alarm Rule": [str(rule)],
+            "Schedule": [str(schedule)],
+            "Active Time, HH:mm": [active_time],
+            "Energy consumed, kWh": [(energy / 1000).round(2)],
+        }
+    )
+
+    return report
