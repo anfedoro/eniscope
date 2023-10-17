@@ -30,7 +30,7 @@ def encrypt(data):
     return encrypted_data
 
 
-# encode_user('webapi@refactorenergy.es', '3DPtbMsGpfKj4Q==')
+
 user_email = input("Enter user email: ")
 user_password = input("Enter user password: ")
 encode_user(user_email, user_password)
